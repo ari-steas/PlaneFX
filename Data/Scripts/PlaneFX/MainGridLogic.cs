@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Linq;
 using PlaneFX.DebugUtils;
 using Sandbox.Game.Entities;
 using Sandbox.ModAPI;
@@ -34,6 +35,14 @@ namespace PlaneFX
         private Dictionary<IMyCubeBlock, MyParticleEffect> _particleBuffer = new Dictionary<IMyCubeBlock, MyParticleEffect>();
         private MyParticleEffect _transonicParticleBuffer = null;
 
+        private Dictionary<MyThrust, MyParticleEffect> _contrailParticleBuffer =
+            new Dictionary<MyThrust, MyParticleEffect>();
+
+        private Dictionary<int, List<MyParticleEffect>> _queuedClosedContrailParticle =
+            new Dictionary<int, List<MyParticleEffect>>();
+
+        internal int Ticks = 0;
+
         #region Base Methods
 
         public override void Init(MyObjectBuilder_EntityBase objectBuilder)
@@ -45,7 +54,7 @@ namespace PlaneFX
 
         public override void UpdateOnceBeforeFrame()
         {
-            if (_grid?.Physics == null)
+            if (_grid?.Physics == null || MyAPIGateway.Utilities.IsDedicated)
                 return;
 
             _grid.OnFatBlockAdded += OnBlockAdd;
@@ -59,11 +68,14 @@ namespace PlaneFX
 
         public override void UpdateAfterSimulation()
         {
+            Ticks++;
+
             if (_wingBlocks.Count == 0 || _grid.IsStatic)
                 return;
             try
             {
-                MyAPIGateway.Utilities.ShowNotification("Wing Count: " + _wingBlocks.Count, 1000 / 60);
+                //MyAPIGateway.Utilities.ShowNotification("Wing Count: " + _wingBlocks.Count, 1000 / 60);
+
 
                 Vector3D gridPosition = _grid.PositionComp.GetPosition();
                 Vector3 localVelocity = WorldToLocal(_grid.LinearVelocity + gridPosition, _grid.WorldMatrix);
@@ -80,7 +92,7 @@ namespace PlaneFX
                 /* Calculate transonic vapor cone */
 
                 // Approximate curve based on https://www.engineeringtoolbox.com/elevation-speed-sound-air-d_1534.html, accurate down to 22.68 kPa.
-                double speedOfSound = Math.Pow(8947200*airDensity - 899699, 1/3.42938) + 236.712;
+                double speedOfSound = Math.Pow(8947200 * airDensity - 899699, 1 / 3.42938) + 236.712;
                 if (speedOfSound < 295.1)
                     speedOfSound = 295.1;
 
@@ -90,18 +102,21 @@ namespace PlaneFX
                     if (_transonicParticleBuffer == null)
                     {
                         MatrixD gridCenter = MatrixD.CreateWorld(_grid.Physics.CenterOfMassLocal);
-                        MyParticlesManager.TryCreateParticleEffect("AryxAvia_WingCloudEffect", ref gridCenter, ref Vector3D.Zero, _grid.Render.GetRenderObjectID(), out _transonicParticleBuffer);
+                        MyParticlesManager.TryCreateParticleEffect("AryxAvia_WingCloudEffect", ref gridCenter,
+                            ref Vector3D.Zero, _grid.Render.GetRenderObjectID(), out _transonicParticleBuffer);
                     }
 
-                    float velocityScalar = 1 - (float) (Math.Abs(speed - speedOfSound) / (speedOfSound * TransonicRange));
-                    _transonicParticleBuffer.UserScale = velocityScalar * (((_grid.Max - _grid.Min).Length() + 1) * _grid.GridSize / 4);
+                    float velocityScalar =
+                        1 - (float)(Math.Abs(speed - speedOfSound) / (speedOfSound * TransonicRange));
+                    _transonicParticleBuffer.UserScale =
+                        velocityScalar * (((_grid.Max - _grid.Min).Length() + 1) * _grid.GridSize / 4);
                 }
                 else if (_transonicParticleBuffer != null)
                 {
                     _transonicParticleBuffer.Stop();
                     _transonicParticleBuffer = null;
                 }
-                DebugDraw.AddPoint(_grid.Physics.CenterOfMassWorld, Color.Blue, -1);
+                //DebugDraw.AddPoint(_grid.Physics.CenterOfMassWorld, Color.Blue, -1);
 
 
                 /* Calculate wing vapor */
@@ -131,6 +146,52 @@ namespace PlaneFX
 
                     AssignParticleEffects(block, data, (Math.Abs(liftForce) - MinParticleThreshold) / ParticleScalar);
                 }
+
+                /* Calculate Contrails */
+
+                // Technically density should be 0.311 but that's all the way up in space in SE
+                if (airDensity < 0.6 && speed > 50)
+                {
+                    foreach (var thruster in _contrailParticleBuffer.Keys.ToArray())
+                    {
+                        if (_contrailParticleBuffer[thruster] != null)
+                            continue;
+
+                        MyParticleEffect particle;
+                        MyParticlesManager.TryCreateParticleEffect("Aristeas_ContrailEffect", ref MatrixD.Identity,
+                            ref Vector3D.Zero, thruster.Render.GetRenderObjectID(), out particle);
+                        if (particle == null)
+                            continue;
+
+                        _contrailParticleBuffer[thruster] = particle;
+                    }
+                }
+                else
+                {
+                    MyParticleEffect particle;
+                    foreach (var thruster in _contrailParticleBuffer.Keys.ToArray())
+                    {
+                        particle = _contrailParticleBuffer[thruster];
+                        if (particle == null)
+                            continue;
+
+                        particle.StopEmitting();
+                        if (!_queuedClosedContrailParticle.ContainsKey(Ticks + 1800))
+                            _queuedClosedContrailParticle[Ticks + 1800] = new List<MyParticleEffect> { particle };
+                        else
+                            _queuedClosedContrailParticle[Ticks + 1800].Add(particle);
+                        
+                        _contrailParticleBuffer[thruster] = null;
+                    }
+                }
+
+                // Clean up old particles
+                foreach (int tick in _queuedClosedContrailParticle.Keys.ToArray())
+                {
+                    if (tick > Ticks) continue;
+                    _queuedClosedContrailParticle[tick].ForEach(p => p.Stop());
+                    _queuedClosedContrailParticle.Remove(tick);
+                }
             }
             catch (Exception ex)
             {
@@ -145,6 +206,14 @@ namespace PlaneFX
 
         private void OnBlockAdd(IMyCubeBlock block)
         {
+            // Thrust check
+            if (block is IMyThrust)
+            {
+                _contrailParticleBuffer.Add((MyThrust) block, null);
+                return;
+            }
+
+            // Wing check
             if (block?.GameLogic?.Container == null)
                 return;
 
@@ -158,7 +227,7 @@ namespace PlaneFX
 
             if (!hasWingLogic)
                 return;
-            MyAPIGateway.Utilities.ShowNotification("Block has wing logic!");
+            //MyAPIGateway.Utilities.ShowNotification("Block has wing logic!");
 
             if (!MainSession.I.WingDatas.ContainsKey(block.BlockDefinition))
                 MainSession.I.WingDatas[block.BlockDefinition] = new WingData(block);
@@ -168,6 +237,13 @@ namespace PlaneFX
 
         private void OnBlockRemove(IMyCubeBlock block)
         {
+            // Thrust check
+            if (block is IMyThrust)
+            {
+                _contrailParticleBuffer.Remove((MyThrust) block);
+                return;
+            }
+
             _wingBlocks.Remove(block);
         }
 

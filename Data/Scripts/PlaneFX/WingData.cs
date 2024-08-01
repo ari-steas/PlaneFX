@@ -18,7 +18,7 @@ namespace PlaneFX
             Size = Vector3I.Abs((Vector3I) Vector3.Transform(block.Max - block.Min + Vector3I.One, block.LocalMatrix.GetOrientation())); // TODO does this need to be rotated?
             Volume = Size.X * Size.Y * Size.Z;
             CalculateNormal(block);
-            MyAPIGateway.Utilities.ShowMessage(block.BlockDefinition.SubtypeName, $"Normal: {Normal}\n    Size: {Size}");
+            //MyAPIGateway.Utilities.ShowMessage(block.BlockDefinition.SubtypeName, $"Normal: {Normal}\n    Size: {Size}");
         }
 
         private void CalculateNormal(IMyCubeBlock block)
