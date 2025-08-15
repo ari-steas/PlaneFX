@@ -41,6 +41,8 @@ namespace PlaneFX
         private Dictionary<int, List<MyParticleEffect>> _queuedClosedContrailParticle =
             new Dictionary<int, List<MyParticleEffect>>();
 
+        private bool _particlesRemoved = true;
+
         internal int Ticks = 0;
 
         #region Base Methods
@@ -75,121 +77,14 @@ namespace PlaneFX
             try
             {
                 //MyAPIGateway.Utilities.ShowNotification("Wing Count: " + _wingBlocks.Count, 1000 / 60);
-
-
-                Vector3D gridPosition = _grid.PositionComp.GetPosition();
-                Vector3 localVelocity = WorldToLocal(_grid.LinearVelocity + gridPosition, _grid.WorldMatrix);
-                float speed = localVelocity.Length();
-                if (speed < 1)
-                    return;
-
-                Vector3D dragNormal = -Vector3D.Normalize(localVelocity);
-
-                float airDensity = MainSession.I.GetAtmosphereDensity(_grid);
-                if (airDensity == 0)
-                    return;
-
-                /* Calculate transonic vapor cone */
-
-                // Approximate curve based on https://www.engineeringtoolbox.com/elevation-speed-sound-air-d_1534.html, accurate down to 22.68 kPa.
-                double speedOfSound = Math.Pow(8947200 * airDensity - 899699, 1 / 3.42938) + 236.712;
-                if (speedOfSound < 295.1)
-                    speedOfSound = 295.1;
-
-                // Check if plane is in transonic range
-                if (speed < speedOfSound * (1 + TransonicRange) && speed > speedOfSound * (1 - TransonicRange))
-                {
-                    if (_transonicParticleBuffer == null)
-                    {
-                        MatrixD gridCenter = MatrixD.CreateWorld(_grid.Physics.CenterOfMassLocal);
-                        MyParticlesManager.TryCreateParticleEffect("AryxAvia_WingCloudEffect", ref gridCenter,
-                            ref Vector3D.Zero, _grid.Render.GetRenderObjectID(), out _transonicParticleBuffer);
-                    }
-
-                    float velocityScalar =
-                        1 - (float)(Math.Abs(speed - speedOfSound) / (speedOfSound * TransonicRange));
-                    _transonicParticleBuffer.UserScale =
-                        velocityScalar * (((_grid.Max - _grid.Min).Length() + 1) * _grid.GridSize / 4);
-                }
-                else if (_transonicParticleBuffer != null)
-                {
-                    _transonicParticleBuffer.Stop();
-                    _transonicParticleBuffer = null;
-                }
-                //DebugDraw.AddPoint(_grid.Physics.CenterOfMassWorld, Color.Blue, -1);
-
-
-                /* Calculate wing vapor */
-
-                foreach (var block in _wingBlocks)
-                {
-                    // Velocity at the center of the wing block
-                    // We're performing calculations relative to the grid because it's easier that way
-                    WingData data = MainSession.I.WingDatas[block.BlockDefinition];
-                    Vector3D wingNormal = data.Normal;
-                    if (wingNormal == Vector3D.Zero)
-                        continue;
-
-                    Vector3D liftNormal = LocalToWorld(wingNormal, block.LocalMatrix) - block.LocalMatrix.Translation;
-
-                    // angle between chord line and airflow
-                    double angleOfAttack = Math.Asin(Vector3D.Dot(dragNormal, liftNormal));
-                    double liftCoefficient =
-                        1.35 * Math.Sin(5.75 * angleOfAttack); // Approximation of NACA 0012 airfoil
-
-                    double dynamicUnitPressure = 0.5 * speed * speed * airDensity;
-
-                    double liftForce = liftCoefficient * dynamicUnitPressure;
-
-                    //DebugDraw.DrawLineZT(block.WorldMatrix.Translation,
-                    //    Vector3D.Transform(wingNormal * liftForce/1000, block.WorldMatrix), Math.Abs(liftForce) > MinParticleThreshold ? Color.Blue : Color.Red, 0.25f);
-
-                    AssignParticleEffects(block, data, (Math.Abs(liftForce) - MinParticleThreshold) / ParticleScalar);
-                }
-
-                /* Calculate Contrails */
-
-                // Technically density should be 0.311 but that's all the way up in space in SE
-                if (airDensity < 0.6 && speed > 50)
-                {
-                    foreach (var thruster in _contrailParticleBuffer.Keys.ToArray())
-                    {
-                        if (_contrailParticleBuffer[thruster] != null)
-                            continue;
-
-                        MyParticleEffect particle;
-                        MyParticlesManager.TryCreateParticleEffect("Aristeas_ContrailEffect", ref MatrixD.Identity,
-                            ref Vector3D.Zero, thruster.Render.GetRenderObjectID(), out particle);
-                        if (particle == null)
-                            continue;
-
-                        _contrailParticleBuffer[thruster] = particle;
-                    }
-                }
-                else
-                {
-                    MyParticleEffect particle;
-                    foreach (var thruster in _contrailParticleBuffer.Keys.ToArray())
-                    {
-                        particle = _contrailParticleBuffer[thruster];
-                        if (particle == null)
-                            continue;
-
-                        particle.StopEmitting();
-                        if (!_queuedClosedContrailParticle.ContainsKey(Ticks + 1800))
-                            _queuedClosedContrailParticle[Ticks + 1800] = new List<MyParticleEffect> { particle };
-                        else
-                            _queuedClosedContrailParticle[Ticks + 1800].Add(particle);
-                        
-                        _contrailParticleBuffer[thruster] = null;
-                    }
-                }
+                PerformAeroCalcs();
 
                 // Clean up old particles
                 foreach (int tick in _queuedClosedContrailParticle.Keys.ToArray())
                 {
                     if (tick > Ticks) continue;
-                    _queuedClosedContrailParticle[tick].ForEach(p => p.Stop());
+                    foreach (var p in _queuedClosedContrailParticle[tick])
+                        p.Stop();
                     _queuedClosedContrailParticle.Remove(tick);
                 }
             }
@@ -248,6 +143,161 @@ namespace PlaneFX
         }
 
         #endregion
+
+        private void PerformAeroCalcs()
+        {
+            Vector3D gridPosition = _grid.PositionComp.GetPosition();
+            Vector3 localVelocity = WorldToLocal(_grid.LinearVelocity + gridPosition, _grid.WorldMatrix);
+            float speed = localVelocity.Length();
+            if (speed < 1)
+                return;
+
+            Vector3D dragNormal = -Vector3D.Normalize(localVelocity);
+
+            float airDensity = MainSession.I.GetAtmosphereDensity(_grid);
+            //MyAPIGateway.Utilities.ShowNotification(airDensity.ToString("F"), 1000/60);
+            if (airDensity <= 0.35)
+            {
+                if (!_particlesRemoved)
+                    ClearParticles();
+                return;
+            }
+            _particlesRemoved = false;
+
+            /* Calculate transonic vapor cone */
+
+            // Approximate curve based on https://www.engineeringtoolbox.com/elevation-speed-sound-air-d_1534.html, accurate down to 22.68 kPa.
+            double speedOfSound = Math.Pow(8947200 * airDensity - 899699, 1 / 3.42938) + 236.712;
+            if (speedOfSound < 295.1)
+                speedOfSound = 295.1;
+
+            // Check if plane is in transonic range
+            if (speed < speedOfSound * (1 + TransonicRange) && speed > speedOfSound * (1 - TransonicRange))
+            {
+                if (_transonicParticleBuffer == null)
+                {
+                    MatrixD gridCenter = MatrixD.CreateWorld(_grid.Physics.CenterOfMassLocal);
+                    MyParticlesManager.TryCreateParticleEffect("AryxAvia_WingCloudEffect", ref gridCenter,
+                        ref Vector3D.Zero, _grid.Render.GetRenderObjectID(), out _transonicParticleBuffer);
+                }
+
+                float velocityScalar =
+                    1 - (float)(Math.Abs(speed - speedOfSound) / (speedOfSound * TransonicRange));
+                _transonicParticleBuffer.UserScale =
+                    velocityScalar * (((_grid.Max - _grid.Min).Length() + 1) * _grid.GridSize / 4);
+            }
+            else if (_transonicParticleBuffer != null)
+            {
+                _transonicParticleBuffer.Stop();
+                _transonicParticleBuffer = null;
+            }
+            //DebugDraw.AddPoint(_grid.Physics.CenterOfMassWorld, Color.Blue, -1);
+
+
+            /* Calculate wing vapor */
+
+            foreach (var block in _wingBlocks)
+            {
+                // Velocity at the center of the wing block
+                // We're performing calculations relative to the grid because it's easier that way
+                WingData data = MainSession.I.WingDatas[block.BlockDefinition];
+                Vector3D wingNormal = data.Normal;
+                if (wingNormal == Vector3D.Zero)
+                    continue;
+
+                Vector3D liftNormal = LocalToWorld(wingNormal, block.LocalMatrix) - block.LocalMatrix.Translation;
+
+                // angle between chord line and airflow
+                double angleOfAttack = Math.Asin(Vector3D.Dot(dragNormal, liftNormal));
+                double liftCoefficient =
+                    1.35 * Math.Sin(5.75 * angleOfAttack); // Approximation of NACA 0012 airfoil
+
+                double dynamicUnitPressure = 0.5 * speed * speed * airDensity;
+
+                double liftForce = liftCoefficient * dynamicUnitPressure;
+
+                //DebugDraw.DrawLineZT(block.WorldMatrix.Translation,
+                //    Vector3D.Transform(wingNormal * liftForce/1000, block.WorldMatrix), Math.Abs(liftForce) > MinParticleThreshold ? Color.Blue : Color.Red, 0.25f);
+
+                AssignParticleEffects(block, data, (Math.Abs(liftForce) - MinParticleThreshold) / ParticleScalar);
+            }
+
+            /* Calculate Contrails */
+
+            // Technically density should be 0.311 but that's all the way up in space in SE
+            if (airDensity < 0.6 && speed > 50)
+            {
+                foreach (var thruster in _contrailParticleBuffer.Keys.ToArray())
+                {
+                    if (_contrailParticleBuffer[thruster] != null)
+                        continue;
+
+                    MyParticleEffect particle;
+                    MyParticlesManager.TryCreateParticleEffect("Aristeas_ContrailEffect", ref MatrixD.Identity,
+                        ref Vector3D.Zero, thruster.Render.GetRenderObjectID(), out particle);
+                    if (particle == null)
+                        continue;
+
+                    _contrailParticleBuffer[thruster] = particle;
+                }
+            }
+            else
+            {
+                MyParticleEffect particle;
+                foreach (var thruster in _contrailParticleBuffer.Keys.ToArray())
+                {
+                    particle = _contrailParticleBuffer[thruster];
+                    if (particle == null)
+                        continue;
+
+                    particle.StopEmitting();
+                    if (!_queuedClosedContrailParticle.ContainsKey(Ticks + 1800))
+                        _queuedClosedContrailParticle[Ticks + 1800] = new List<MyParticleEffect> { particle };
+                    else
+                        _queuedClosedContrailParticle[Ticks + 1800].Add(particle);
+                    
+                    _contrailParticleBuffer[thruster] = null;
+                }
+            }
+        }
+
+        private void ClearParticles()
+        {
+            // transonic
+            if (_transonicParticleBuffer != null)
+            {
+                _transonicParticleBuffer.Stop();
+                _transonicParticleBuffer = null;
+            }
+
+            // wing vapor
+            foreach (var block in _wingBlocks)
+            {
+                MyParticleEffect effect;
+                if (MainSession.I.WingDatas[block.BlockDefinition].Normal == Vector3D.Zero || !_particleBuffer.TryGetValue(block, out effect))
+                    continue;
+                effect.Stop();
+                _particleBuffer.Remove(block);
+            }
+
+            MyParticleEffect particle;
+            foreach (var thruster in _contrailParticleBuffer.Keys.ToArray())
+            {
+                particle = _contrailParticleBuffer[thruster];
+                if (particle == null)
+                    continue;
+
+                particle.StopEmitting();
+                if (!_queuedClosedContrailParticle.ContainsKey(Ticks + 1800))
+                    _queuedClosedContrailParticle[Ticks + 1800] = new List<MyParticleEffect> { particle };
+                else
+                    _queuedClosedContrailParticle[Ticks + 1800].Add(particle);
+                        
+                _contrailParticleBuffer[thruster] = null;
+            }
+
+            _particlesRemoved = true;
+        }
 
         private void AssignParticleEffects(IMyCubeBlock block, WingData wingData, double intensity)
         {
